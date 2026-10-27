@@ -552,28 +552,61 @@ app.get('/api/toonstream/series', async (req, res) => {
 // 3. Episode Stream Resolver (/api/toonstream/episode)
 app.get('/api/toonstream/episode', async (req, res) => {
   const episodeUrl = req.query.episodeUrl as string;
+  const audio = ((req.query.audio as string) || '').toUpperCase();
   if (!episodeUrl) {
     return res.status(400).json({ success: false, error: 'episodeUrl parameter required' });
   }
 
-  const targetUrl = episodeUrl.startsWith('http')
+  const baseTargetUrl = episodeUrl.startsWith('http')
     ? episodeUrl
     : `https://toonstream.vip${episodeUrl.startsWith('/') ? '' : '/'}${episodeUrl}`;
 
+  // Build candidate URL variations (sub vs dub vs hindi slug patterns)
+  const candidateUrls: string[] = [];
+  const cleanBase = baseTargetUrl.replace(/\/$/, '');
+
+  if (audio === 'DUB') {
+    if (!cleanBase.endsWith('-dub')) {
+      candidateUrls.push(`${cleanBase}-dub/`);
+      candidateUrls.push(`${cleanBase.replace(/-\d+x\d+/, (m) => `${m}-dub`)}/`);
+    }
+  } else if (audio === 'HINDI') {
+    if (!cleanBase.endsWith('-hindi')) {
+      candidateUrls.push(`${cleanBase}-hindi/`);
+      candidateUrls.push(`${cleanBase.replace(/-\d+x\d+/, (m) => `${m}-hindi`)}/`);
+    }
+  } else if (audio === 'SUB') {
+    if (cleanBase.endsWith('-dub') || cleanBase.endsWith('-hindi')) {
+      candidateUrls.push(`${cleanBase.replace(/-(dub|hindi)$/, '')}/`);
+    }
+  }
+  // Include direct URL
+  if (!candidateUrls.includes(baseTargetUrl)) {
+    candidateUrls.push(baseTargetUrl);
+  }
+
   try {
     let servers: { name: string; url: string }[] = [];
+    let resolvedUrl = baseTargetUrl;
 
-    try {
-      const pageRes = await axios.get(targetUrl, { headers: ANIME_HEADERS, timeout: 6000 });
-      servers = extractServersFromHtml(pageRes.data);
-    } catch (scrapeErr: any) {
-      console.warn('Episode scraping timed out, using fallback server resolution:', scrapeErr.message);
+    for (const candUrl of candidateUrls) {
+      try {
+        const pageRes = await axios.get(candUrl, { headers: ANIME_HEADERS, timeout: 6000 });
+        const extracted = extractServersFromHtml(pageRes.data);
+        if (extracted.length > 0) {
+          servers = extracted;
+          resolvedUrl = candUrl;
+          break;
+        }
+      } catch (e: any) {
+        // try next candidate
+      }
     }
 
-    // Fallback server list if live server didn't respond or blocked
+    // Fallback server list if live server didn't respond or was blocked
     if (servers.length === 0) {
       for (const a of FALLBACK_ANIMES) {
-        const ep = a.episodes.find((e) => e.url === targetUrl || targetUrl.includes(a.slug));
+        const ep = a.episodes.find((e) => e.url === baseTargetUrl || baseTargetUrl.includes(a.slug));
         if (ep && ep.servers) {
           servers = ep.servers;
           break;
@@ -590,7 +623,7 @@ app.get('/api/toonstream/episode', async (req, res) => {
       ];
     }
 
-    return res.json({ success: true, directUrl: targetUrl, servers });
+    return res.json({ success: true, directUrl: resolvedUrl, servers });
   } catch (err: any) {
     return res.json({
       success: false,

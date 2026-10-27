@@ -44,10 +44,15 @@ export async function fetchSeriesDetails(pageUrl: string): Promise<SeriesDetails
 }
 
 export async function fetchEpisodeServers(
-  episodeUrl: string
+  episodeUrl: string,
+  audio: string = 'SUB'
 ): Promise<{ success: boolean; servers: StreamServer[]; directUrl?: string }> {
   try {
-    const res = await fetch(`/api/toonstream/episode?episodeUrl=${encodeURIComponent(episodeUrl)}`);
+    const params = new URLSearchParams();
+    params.set('episodeUrl', episodeUrl);
+    if (audio) params.set('audio', audio);
+
+    const res = await fetch(`/api/toonstream/episode?${params.toString()}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     return {

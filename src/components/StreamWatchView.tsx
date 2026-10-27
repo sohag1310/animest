@@ -20,6 +20,41 @@ export const StreamWatchView: React.FC<StreamWatchViewProps> = ({ anime, onBack 
   const [activeAudioTrack, setActiveAudioTrack] = useState<'SUB' | 'DUB' | 'HINDI'>('SUB');
   const [isSaved, setIsSaved] = useState(false);
 
+  // Sync Watchlist state on mount and anime change
+  useEffect(() => {
+    try {
+      const saved: ScrapedAnime[] = JSON.parse(localStorage.getItem('toonstream_watchlist') || '[]');
+      const exists = saved.some(
+        (item) => item.pageUrl === anime.pageUrl || (item.mal_id && item.mal_id === anime.mal_id)
+      );
+      setIsSaved(exists);
+    } catch {
+      setIsSaved(false);
+    }
+  }, [anime.pageUrl, anime.mal_id]);
+
+  const toggleWatchlist = () => {
+    try {
+      const saved: ScrapedAnime[] = JSON.parse(localStorage.getItem('toonstream_watchlist') || '[]');
+      const exists = saved.some(
+        (item) => item.pageUrl === anime.pageUrl || (item.mal_id && item.mal_id === anime.mal_id)
+      );
+      let updated: ScrapedAnime[];
+      if (exists) {
+        updated = saved.filter(
+          (item) => item.pageUrl !== anime.pageUrl && (!item.mal_id || item.mal_id !== anime.mal_id)
+        );
+        setIsSaved(false);
+      } else {
+        updated = [...saved, anime];
+        setIsSaved(true);
+      }
+      localStorage.setItem('toonstream_watchlist', JSON.stringify(updated));
+    } catch (e) {
+      console.error('Watchlist sync error:', e);
+    }
+  };
+
   // Load series details first
   useEffect(() => {
     let isMounted = true;
@@ -33,7 +68,7 @@ export const StreamWatchView: React.FC<StreamWatchViewProps> = ({ anime, onBack 
         if (details.episodes.length > 0) {
           const firstEp = details.episodes[0];
           setCurrentEpisode(firstEp);
-          loadEpisode(firstEp);
+          loadEpisode(firstEp, activeAudioTrack);
         }
       } else {
         // Fallback default episode
@@ -44,7 +79,7 @@ export const StreamWatchView: React.FC<StreamWatchViewProps> = ({ anime, onBack 
           url: anime.firstEpUrl || anime.pageUrl,
         };
         setCurrentEpisode(fallbackEp);
-        loadEpisode(fallbackEp);
+        loadEpisode(fallbackEp, activeAudioTrack);
       }
     }
 
@@ -54,12 +89,12 @@ export const StreamWatchView: React.FC<StreamWatchViewProps> = ({ anime, onBack 
     };
   }, [anime.pageUrl]);
 
-  // Load servers for given episode
-  const loadEpisode = async (ep: ScrapedEpisode) => {
+  // Load servers for given episode & audio track
+  const loadEpisode = async (ep: ScrapedEpisode, audioTrack: 'SUB' | 'DUB' | 'HINDI' = activeAudioTrack) => {
     setIsLoadingStream(true);
     setSelectedServerIdx(0);
 
-    const streamData = await fetchEpisodeServers(ep.url);
+    const streamData = await fetchEpisodeServers(ep.url, audioTrack);
     setServers(streamData.servers);
     setDirectUrl(streamData.directUrl);
     setIsLoadingStream(false);
@@ -67,8 +102,15 @@ export const StreamWatchView: React.FC<StreamWatchViewProps> = ({ anime, onBack 
 
   const handleSelectEpisode = (ep: ScrapedEpisode) => {
     setCurrentEpisode(ep);
-    loadEpisode(ep);
+    loadEpisode(ep, activeAudioTrack);
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleAudioTrackChange = (track: 'SUB' | 'DUB' | 'HINDI') => {
+    setActiveAudioTrack(track);
+    if (currentEpisode) {
+      loadEpisode(currentEpisode, track);
+    }
   };
 
   const currentEpIndex = seriesDetails?.episodes.findIndex((e) => e.episode === currentEpisode?.episode) ?? -1;
@@ -101,7 +143,7 @@ export const StreamWatchView: React.FC<StreamWatchViewProps> = ({ anime, onBack 
 
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setIsSaved(!isSaved)}
+            onClick={toggleWatchlist}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer ${
               isSaved
                 ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
@@ -129,9 +171,9 @@ export const StreamWatchView: React.FC<StreamWatchViewProps> = ({ anime, onBack 
           currentEpisodeNum={currentEpisode?.episode || 1}
           animeTitle={anime.title}
           activeAudioTrack={activeAudioTrack}
-          setActiveAudioTrack={setActiveAudioTrack}
+          setActiveAudioTrack={handleAudioTrackChange}
           onReloadStream={() => {
-            if (currentEpisode) loadEpisode(currentEpisode);
+            if (currentEpisode) loadEpisode(currentEpisode, activeAudioTrack);
           }}
         />
       </section>
