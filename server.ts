@@ -18,6 +18,10 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Primary Active Streaming Domain (toonstream.us is 200 OK, toonstream.vip redirects)
+const TOONSTREAM_BASE = process.env.TOONSTREAM_BASE || 'https://toonstream.us';
+const TOONSTREAM_BACKUP = 'https://toonstream.vip';
+
 // Anti-bot Request Headers
 const ANIME_HEADERS = {
   'User-Agent':
@@ -25,6 +29,10 @@ const ANIME_HEADERS = {
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.5',
 };
+
+// In-Memory Feed & Resolver Cache (prevents spamming requests & Cloudflare 403 rate limits)
+const feedCache = new Map<string, { timestamp: number; data: any }>();
+const CACHE_TTL = 15 * 60 * 1000; // 15 mins
 
 // Clean Video Server Extractor (extractServersFromHtml)
 export const extractServersFromHtml = (html: string): { name: string; url: string }[] => {
@@ -382,75 +390,73 @@ app.get('/api/toonstream/feed', async (req, res) => {
     const page = parseInt((req.query.page as string) || '1', 10);
     const category = (req.query.category as string) || 'anime';
     const search = (req.query.search as string) || '';
+    const cacheKey = `feed_${page}_${category}_${search}`;
 
-    let fetchUrl = search
-      ? `https://toonstream.vip/s?q=${encodeURIComponent(search)}`
-      : category === 'hindi-dubbed'
-      ? page === 1
-        ? `https://toonstream.vip/category/hindi-dubbed/`
-        : `https://toonstream.vip/category/hindi-dubbed/?page=${page}`
-      : `https://toonstream.vip/category/anime?type=all&page=${page}`;
+    // Return cached feed if available and fresh
+    const cached = feedCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return res.json(cached.data);
+    }
+
+    const buildUrl = (base: string) => {
+      if (search) return `${base}/s?q=${encodeURIComponent(search)}`;
+      if (category === 'hindi-dubbed') {
+        return page === 1 ? `${base}/category/hindi-dubbed/` : `${base}/category/hindi-dubbed/?page=${page}`;
+      }
+      return `${base}/category/anime?type=all&page=${page}`;
+    };
 
     let rawAnimes: any[] = [];
+    const domainsToTry = [TOONSTREAM_BASE, TOONSTREAM_BACKUP];
 
-    try {
-      const response = await axios.get(fetchUrl, { headers: ANIME_HEADERS, timeout: 8000 });
-      const $ = cheerio.load(response.data);
+    for (const base of domainsToTry) {
+      const fetchUrl = buildUrl(base);
+      try {
+        const response = await axios.get(fetchUrl, { headers: ANIME_HEADERS, timeout: 10000 });
+        const $ = cheerio.load(response.data);
 
-      $('article').each((_, el) => {
-        const title = $(el).find('.entry-title, h2, h3').first().text().trim();
-        const link = $(el).find('a.lnk-blk').attr('href') || $(el).find('a').first().attr('href') || '';
-        const img = $(el).find('img').attr('src') || $(el).find('img').attr('data-src') || '';
-        const vote = $(el).find('.vote').text().replace(/TMDB/i, '').trim() || '8.5';
+        $('article').each((_, el) => {
+          const title = $(el).find('.entry-title, h2, h3').first().text().trim();
+          const link = $(el).find('a.lnk-blk').attr('href') || $(el).find('a').first().attr('href') || '';
+          const img = $(el).find('img').attr('src') || $(el).find('img').attr('data-src') || '';
+          const vote = $(el).find('.vote').text().replace(/TMDB/i, '').trim() || '8.5';
 
-        if (title && link) {
-          const slug = link.replace(/\/$/, '').split('/').pop() || '';
-          const largeImg = img.includes('/w') ? img.replace(/\/w\d+\//, '/w780/') : img;
+          if (title && link) {
+            const slug = link.replace(/\/$/, '').split('/').pop() || '';
+            const largeImg = img.includes('/w') ? img.replace(/\/w\d+\//, '/w780/') : img;
 
-          rawAnimes.push({
-            mal_id: slug || title.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-            slug,
-            title,
-            title_english: title,
-            pageUrl: link,
-            images: { jpg: { image_url: img, large_image_url: largeImg || img } },
-            score: parseFloat(vote) || 8.5,
-            type: link.includes('/movies/') ? 'Movie' : 'TV',
-          });
+            rawAnimes.push({
+              mal_id: slug || title.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+              slug,
+              title,
+              title_english: title,
+              pageUrl: link,
+              images: { jpg: { image_url: img, large_image_url: largeImg || img } },
+              score: parseFloat(vote) || 8.5,
+              type: link.includes('/movies/') ? 'Movie' : 'TV',
+              hasVideo: true,
+              isMovie: link.includes('/movies/'),
+              episodesCount: link.includes('/movies/') ? 1 : 12,
+            });
+          }
+        });
+
+        if (rawAnimes.length > 0) {
+          break; // Successfully scraped
         }
-      });
-    } catch (scrapeErr: any) {
-      console.warn('Live scraper fetch timed out or blocked, activating fallback anime feed:', scrapeErr.message);
+      } catch (scrapeErr: any) {
+        console.warn(`Scrape attempt failed on ${base}:`, scrapeErr.message);
+      }
     }
 
-    // If live scraper fetched items, verify batches of 6 items concurrently
     if (rawAnimes.length > 0) {
-      const verifiedAnimes: any[] = [];
-      for (let i = 0; i < rawAnimes.length; i += 6) {
-        const chunk = rawAnimes.slice(i, i + 6);
-        const results = await Promise.all(
-          chunk.map(async (item) => {
-            const v = await verifyAnimeVideoAvailability(item.pageUrl);
-            return v.hasVideo
-              ? {
-                  ...item,
-                  hasVideo: true,
-                  isMovie: v.isMovie,
-                  episodesCount: v.episodesCount,
-                  firstEpUrl: v.firstEpUrl,
-                }
-              : null;
-          })
-        );
-        results.forEach((item) => item && verifiedAnimes.push(item));
-      }
-
-      if (verifiedAnimes.length > 0) {
-        return res.json({ success: true, page, animes: verifiedAnimes, source: 'live' });
-      }
+      const result = { success: true, page, animes: rawAnimes, source: 'live' };
+      if (feedCache.size > 200) feedCache.clear();
+      feedCache.set(cacheKey, { timestamp: Date.now(), data: result });
+      return res.json(result);
     }
 
-    // Graceful fallback to verified anime database
+    // Graceful fallback to verified anime database if remote is unavailable
     let fallbackFiltered = FALLBACK_ANIMES;
     if (search) {
       const q = search.toLowerCase();
@@ -475,9 +481,12 @@ app.get('/api/toonstream/series', async (req, res) => {
       return res.status(400).json({ success: false, error: 'url parameter required' });
     }
 
-    const targetUrl = urlPath.startsWith('http')
-      ? urlPath
-      : `https://toonstream.vip${urlPath.startsWith('/') ? '' : '/'}${urlPath}`;
+    const normalizeToonUrl = (url: string) => {
+      let u = url.startsWith('http') ? url : `${TOONSTREAM_BASE}${url.startsWith('/') ? '' : '/'}${url}`;
+      return u.replace('https://toonstream.vip', TOONSTREAM_BASE);
+    };
+
+    const targetUrl = normalizeToonUrl(urlPath);
 
     let title = '';
     let synopsis = '';
@@ -557,9 +566,10 @@ app.get('/api/toonstream/episode', async (req, res) => {
     return res.status(400).json({ success: false, error: 'episodeUrl parameter required' });
   }
 
-  const baseTargetUrl = episodeUrl.startsWith('http')
+  let baseTargetUrl = episodeUrl.startsWith('http')
     ? episodeUrl
-    : `https://toonstream.vip${episodeUrl.startsWith('/') ? '' : '/'}${episodeUrl}`;
+    : `${TOONSTREAM_BASE}${episodeUrl.startsWith('/') ? '' : '/'}${episodeUrl}`;
+  baseTargetUrl = baseTargetUrl.replace('https://toonstream.vip', TOONSTREAM_BASE);
 
   // Build candidate URL variations (sub vs dub vs hindi slug patterns)
   const candidateUrls: string[] = [];
