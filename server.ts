@@ -627,11 +627,7 @@ async function startServer() {
 
     // SPA wildcard fallback
     app.get('*', (_req, res) => {
-      if (fs.existsSync(indexPath)) {
-        res.sendFile(indexPath);
-      } else {
-        res.status(404).send('Build files not found. Please ensure "npm run build" was executed.');
-      }
+      res.sendFile(indexPath);
     });
   }
 
